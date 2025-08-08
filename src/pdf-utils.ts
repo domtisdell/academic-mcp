@@ -27,7 +27,7 @@ export class PDFUtils {
     return PDFUtils.instance;
   }
 
-  async downloadPDF(pdfUrl: string, filename?: string): Promise<string> {
+  async downloadPDF(pdfUrl: string, filename?: string, isRetry: boolean = false): Promise<string> {
     try {
       const response = await axios.get(pdfUrl, { 
         responseType: 'arraybuffer',
@@ -68,14 +68,20 @@ export class PDFUtils {
       // Write PDF to file
       fs.writeFileSync(filepath, response.data);
       
+      // Validate it's actually a PDF file
+      if (!this.isValidPDF(filepath)) {
+        fs.unlinkSync(filepath); // Clean up invalid file
+        throw new Error('Downloaded file is not a valid PDF');
+      }
+      
       console.error(`PDF downloaded successfully: ${filepath}`);
       return filepath;
       
     } catch (error) {
       console.error('Error downloading PDF:', error);
       
-      // Check if this is a paywalled source that we should try to find on ArXiv
-      if (this.isPaywalledSource(pdfUrl)) {
+      // Check if this is a paywalled source that we should try to find on ArXiv (but only if not already a retry)
+      if (!isRetry && this.isPaywalledSource(pdfUrl)) {
         console.error('Detected paywalled source, attempting to find paper on ArXiv...');
         
         const paperTitle = this.extractTitleFromUrl(pdfUrl, filename);
@@ -84,7 +90,7 @@ export class PDFUtils {
             const arxivPdfUrl = await this.findPaperOnArxiv(paperTitle);
             if (arxivPdfUrl) {
               console.error(`Found paper on ArXiv: ${arxivPdfUrl}`);
-              return await this.downloadPDF(arxivPdfUrl, filename);
+              return await this.downloadPDF(arxivPdfUrl, filename, true);
             }
           } catch (arxivError) {
             console.error('Failed to find paper on ArXiv:', arxivError);
@@ -93,6 +99,16 @@ export class PDFUtils {
       }
       
       throw new Error(`Failed to download PDF: ${error instanceof Error ? error.message : 'Unknown error'}`);
+    }
+  }
+
+  private isValidPDF(filepath: string): boolean {
+    try {
+      const buffer = fs.readFileSync(filepath);
+      // Check PDF magic number (first 4 bytes should be %PDF)
+      return buffer.length >= 4 && buffer.toString('ascii', 0, 4) === '%PDF';
+    } catch {
+      return false;
     }
   }
 
