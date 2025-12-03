@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
-import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js';
+import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
@@ -10,7 +10,6 @@ import {
 import { ArxivClient } from './arxiv.js';
 import { GoogleScholarClient } from './scholar.js';
 import { PDFUtils } from './pdf-utils.js';
-import express, { Request, Response } from 'express';
 
 const arxivClient = new ArxivClient();
 const scholarClient = new GoogleScholarClient();
@@ -169,7 +168,7 @@ const tools: Tool[] = [
   },
   {
     name: 'download_and_read_pdf',
-    description: 'Download a PDF and attempt to read its text content',
+    description: 'Download a PDF and attempt to read its text content. Use startPage and endPage to paginate through large PDFs. First call without page params to get total pages, then call read_pdf_text with specific page ranges.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -180,6 +179,14 @@ const tools: Tool[] = [
         filename: {
           type: 'string',
           description: 'Optional filename for the downloaded PDF',
+        },
+        startPage: {
+          type: 'number',
+          description: 'Starting page number (1-based). Defaults to 1.',
+        },
+        endPage: {
+          type: 'number',
+          description: 'Ending page number (1-based). Defaults to 10 to avoid truncation. Use read_pdf_text for subsequent pages.',
         },
       },
       required: ['pdfUrl'],
@@ -213,6 +220,37 @@ function setupServerHandlers(server: Server) {
 
     try {
       switch (name) {
+        case 'search_arxiv_by_category': {
+          const { category, maxResults = 10, sortBy = 'submittedDate' } = args as {
+            category: string;
+            maxResults?: number;
+            sortBy?: 'relevance' | 'lastUpdatedDate' | 'submittedDate';
+          };
+          const query = `cat:${category}`;
+          const results = await arxivClient.searchPapers(query, maxResults, sortBy);
+
+          return {
+            content: [
+              {
+                type: 'text',
+                text: JSON.stringify({
+                  source: 'ArXiv',
+                  category,
+                  results: results.map(paper => ({
+                    title: paper.title,
+                    authors: paper.authors,
+                    abstract: paper.abstract,
+                    published: paper.published,
+                    categories: paper.categories,
+                    pdfUrl: paper.pdfUrl,
+                    htmlUrl: paper.htmlUrl,
+                  })),
+                }, null, 2),
+              },
+            ],
+          };
+        }
+
         case 'search_arxiv': {
           const { query, maxResults = 10, sortBy = 'relevance' } = args as {
             query: string;
@@ -423,7 +461,12 @@ function setupServerHandlers(server: Server) {
               ],
             };
           } else {
-            const text = await pdfUtils.readPDFText(filepath, startPage, endPage);
+            // Get total pages for context
+            const totalPages = await pdfUtils.getPDFPageCount(filepath);
+            const effectiveStartPage = startPage || 1;
+            const effectiveEndPage = endPage ? Math.min(endPage, totalPages) : totalPages;
+
+            const text = await pdfUtils.readPDFText(filepath, effectiveStartPage, effectiveEndPage);
             return {
               content: [
                 {
@@ -431,8 +474,11 @@ function setupServerHandlers(server: Server) {
                   text: JSON.stringify({
                     action: 'read_pdf_text',
                     filepath,
-                    startPage,
-                    endPage,
+                    totalPages,
+                    startPage: effectiveStartPage,
+                    endPage: effectiveEndPage,
+                    hasMorePages: effectiveEndPage < totalPages,
+                    nextPageRange: effectiveEndPage < totalPages ? `startPage=${effectiveEndPage + 1}, endPage=${Math.min(effectiveEndPage + 5, totalPages)}` : null,
                     text
                   }, null, 2),
                 },
@@ -442,12 +488,25 @@ function setupServerHandlers(server: Server) {
         }
 
         case 'download_and_read_pdf': {
-          const { pdfUrl, filename } = args as {
+          const { pdfUrl, filename, startPage = 1, endPage = 10 } = args as {
             pdfUrl: string;
             filename?: string;
+            startPage?: number;
+            endPage?: number;
           };
-          const result = await pdfUtils.downloadAndReadPDF(pdfUrl, filename);
-          
+
+          // First download the PDF
+          const filepath = await pdfUtils.downloadPDF(pdfUrl, filename);
+
+          // Get total pages
+          const totalPages = await pdfUtils.getPDFPageCount(filepath);
+
+          // Limit endPage to actual total pages
+          const effectiveEndPage = Math.min(endPage, totalPages);
+
+          // Read the specified page range
+          const text = await pdfUtils.readPDFText(filepath, startPage, effectiveEndPage);
+
           return {
             content: [
               {
@@ -455,8 +514,13 @@ function setupServerHandlers(server: Server) {
                 text: JSON.stringify({
                   action: 'download_and_read_pdf',
                   pdfUrl,
-                  filepath: result.filepath,
-                  text: result.text
+                  filepath,
+                  totalPages,
+                  startPage,
+                  endPage: effectiveEndPage,
+                  hasMorePages: effectiveEndPage < totalPages,
+                  nextPageRange: effectiveEndPage < totalPages ? `Use read_pdf_text with startPage=${effectiveEndPage + 1} and endPage=${Math.min(effectiveEndPage + 10, totalPages)}` : null,
+                  text
                 }, null, 2),
               },
             ],
@@ -516,51 +580,22 @@ function setupServerHandlers(server: Server) {
 }
 
 async function main() {
-  const app = express();
-  let servers: Server[] = [];
-
-  app.get("/sse", async (req: Request, res: Response) => {
-    console.log("Got new SSE connection");
-    const transport = new SSEServerTransport("/message", res);
-    const server = new Server(
-      {
-        name: "scientific-research-server",
-        version: "1.0.0",
+  const server = new Server(
+    {
+      name: "scientific-research-server",
+      version: "1.0.0",
+    },
+    {
+      capabilities: {
+        tools: {},
       },
-      {
-        capabilities: {
-          tools: {},
-        },
-      }
-    );
-    
-    setupServerHandlers(server);
-    
-    servers.push(server);
-    server.onclose = () => {
-      console.log("SSE connection closed");
-      servers = servers.filter((s) => s !== server);
-    };
-    await server.connect(transport);
-  });
-
-  app.post("/message", async (req: Request, res: Response) => {
-    console.log("Received message");
-    const sessionId = req.query.sessionId as string;
-    const transport = servers
-      .map((s) => s.transport as SSEServerTransport)
-      .find((t) => t.sessionId === sessionId);
-    if (!transport) {
-      res.status(404).send("Session not found");
-      return;
     }
-    await transport.handlePostMessage(req, res);
-  });
+  );
 
-  const port = process.env.PORT || 8080;
-  app.listen(port, () => {
-    console.log(`Server running on http://localhost:${port}/sse`);
-  });
+  setupServerHandlers(server);
+
+  const transport = new StdioServerTransport();
+  await server.connect(transport);
 }
 
 main().catch(console.error);

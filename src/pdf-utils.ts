@@ -2,11 +2,10 @@ import axios from 'axios';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
-import { exec } from 'child_process';
 import { promisify } from 'util';
 import { parseString } from 'xml2js';
+import { getDocument } from 'pdfjs-dist/legacy/build/pdf.mjs';
 
-const execAsync = promisify(exec);
 const parseXML = promisify(parseString);
 
 export class PDFUtils {
@@ -222,29 +221,49 @@ export class PDFUtils {
         throw new Error(`PDF file not found: ${filepath}`);
       }
 
-      // Use pdftotext command line tool (part of poppler-utils)
-      try {
-        let command = `pdftotext "${filepath}" -`;
-        
-        // Add page range if specified
-        if (startPage !== undefined) {
-          command = `pdftotext -f ${startPage}`;
-          if (endPage !== undefined) {
-            command += ` -l ${endPage}`;
+      // Read PDF file as Uint8Array
+      const data = new Uint8Array(fs.readFileSync(filepath));
+
+      // Load the PDF document (disableWorker for Node.js compatibility)
+      const loadingTask = getDocument({ data, useSystemFonts: true, isEvalSupported: false, disableFontFace: true });
+      const pdfDocument = await loadingTask.promise;
+
+      const totalPages = pdfDocument.numPages;
+      const start = startPage || 1;
+      const end = endPage || totalPages;
+
+      const textParts: string[] = [];
+
+      // Extract text from each page
+      for (let pageNum = start; pageNum <= Math.min(end, totalPages); pageNum++) {
+        const page = await pdfDocument.getPage(pageNum);
+        const textContent = await page.getTextContent();
+
+        // Combine text items, preserving some structure
+        let lastY: number | null = null;
+        const pageText: string[] = [];
+
+        for (const item of textContent.items) {
+          if ('str' in item) {
+            const text = item.str;
+            const transform = item.transform;
+            const y = transform ? transform[5] : 0;
+
+            // Add newline if Y position changed significantly (new line)
+            if (lastY !== null && Math.abs(y - lastY) > 5) {
+              pageText.push('\n');
+            }
+
+            pageText.push(text);
+            lastY = y;
           }
-          command += ` "${filepath}" -`;
         }
-        
-        const { stdout } = await execAsync(command);
-        return stdout;
-      } catch (pdftoTextError) {
-        // Fallback: try to use pdf-poppler to convert to images and then OCR
-        console.error('pdftotext failed, trying alternative method:', pdftoTextError);
-        
-        // For now, return a simple message - in production you'd want to implement OCR
-        return 'PDF text extraction failed. Please ensure pdftotext is installed (brew install poppler on macOS).';
+
+        textParts.push(`--- Page ${pageNum} ---\n${pageText.join(' ')}`);
       }
-      
+
+      return textParts.join('\n\n');
+
     } catch (error) {
       console.error('Error reading PDF:', error);
       throw new Error(`Failed to read PDF: ${error instanceof Error ? error.message : 'Unknown error'}`);
@@ -258,25 +277,27 @@ export class PDFUtils {
         throw new Error(`PDF file not found: ${filepath}`);
       }
 
-      // Get total number of pages
-      const { stdout: pageInfo } = await execAsync(`pdfinfo "${filepath}" | grep Pages`);
-      const totalPages = parseInt(pageInfo.split(':')[1].trim()) || 0;
-      
+      // Read PDF file and get total pages using pdfjs-dist
+      const data = new Uint8Array(fs.readFileSync(filepath));
+      const loadingTask = getDocument({ data, useSystemFonts: true, isEvalSupported: false, disableFontFace: true });
+      const pdfDocument = await loadingTask.promise;
+      const totalPages = pdfDocument.numPages;
+
       if (totalPages === 0) {
         throw new Error('Could not determine PDF page count');
       }
 
       const chunks: string[] = [];
-      
+
       // Read PDF in chunks
       for (let startPage = 1; startPage <= totalPages; startPage += chunkSize) {
         const endPage = Math.min(startPage + chunkSize - 1, totalPages);
         const chunkText = await this.readPDFText(filepath, startPage, endPage);
         chunks.push(chunkText);
       }
-      
+
       return { chunks, totalPages };
-      
+
     } catch (error) {
       console.error('Error reading PDF in chunks:', error);
       throw new Error(`Failed to read PDF in chunks: ${error instanceof Error ? error.message : 'Unknown error'}`);
@@ -287,6 +308,22 @@ export class PDFUtils {
     const filepath = await this.downloadPDF(pdfUrl, filename);
     const text = await this.readPDFText(filepath);
     return { filepath, text };
+  }
+
+  async getPDFPageCount(filepath: string): Promise<number> {
+    try {
+      if (!fs.existsSync(filepath)) {
+        throw new Error(`PDF file not found: ${filepath}`);
+      }
+
+      const data = new Uint8Array(fs.readFileSync(filepath));
+      const loadingTask = getDocument({ data, useSystemFonts: true, isEvalSupported: false, disableFontFace: true });
+      const pdfDocument = await loadingTask.promise;
+      return pdfDocument.numPages;
+    } catch (error) {
+      console.error('Error getting PDF page count:', error);
+      throw new Error(`Failed to get PDF page count: ${error instanceof Error ? error.message : 'Unknown error'}`);
+    }
   }
 
   getDownloadsDirectory(): string {
